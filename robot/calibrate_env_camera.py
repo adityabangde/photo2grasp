@@ -379,21 +379,43 @@ def touch_calibrate(cam, arm, mapping, cfg, object_name="lego_tree", spots=4, fr
     return dict(pos=pos, R=R, tag_mm=tag_mm, err_mm=err_mm)
 
 
+ATTEMPT = Path(__file__).parent / "last_depth_calibration.json"  # every depth calibration attempt (--reuse)
+
+
+def leave_one_out(cam_pts, robot_pts):
+    """For each touch: fit the camera from the other touches only and see how far off it puts this one (m).
+    That is the error the robot will have placing an object it was not calibrated on."""
+    cam_pts, robot_pts = np.asarray(cam_pts, float), np.asarray(robot_pts, float)
+    out = []
+    for k in range(len(cam_pts)):
+        t, R, _ = rigid_fit(np.delete(cam_pts, k, 0), np.delete(robot_pts, k, 0))
+        out.append(float(np.linalg.norm(t + R @ cam_pts[k] - robot_pts[k])))
+    return out
+
+
 def save_depth_calibration(cfg, ec, centres, cam_centres, image_pts, K, fovy, sizes, view, own_view, cam):
     """Camera pose from matched 3D points (tag centre seen with depth <-> the same point from the arm), with a
     stability check: the camera estimate without each spot in turn."""
+    ATTEMPT.write_text(json.dumps(dict(world=np.round(centres, 5).tolist(), camera=np.round(cam_centres, 5).tolist(),
+                                       image=np.round(image_pts, 2).tolist(), sizes=list(map(float, sizes)),
+                                       K=np.round(K, 3).tolist(), fovy=fovy), indent=1))  # --reuse re-solves it
     pos, R, err = rigid_fit(cam_centres, centres)
-    moves = [np.linalg.norm(rigid_fit([c for j, c in enumerate(cam_centres) if j != k],
-                                      [c for j, c in enumerate(centres) if j != k])[0] - pos)
-             for k in range(len(centres))] if len(centres) > 3 else [0.0]
+    # what matters is where the robot will think an object is: each touch placed from the others alone
+    misses = leave_one_out(cam_centres, centres) if len(centres) > 3 else [err]
     tag_mm = float(np.median(sizes))
     cf, cs, ch = ruler(pos)
+    worst = int(np.argmax(misses))
     print(f"camera {cf * 100:.1f} cm in front of the rotation axis, {cs * 100:+.1f} cm sideways, {ch * 100:.1f} cm "
           f"high, looking {np.degrees(np.arcsin(-R[2, 2])):.0f} deg down | fit error {err * 1000:.0f} mm | "
-          f"stable within {max(moves) * 100:.1f} cm (leaving out any one spot) | printed tag {tag_mm:.1f} mm")
-    if err > 0.015 or max(moves) > 0.03:
-        print("NOT saved: the touches do not agree (a spot was off the tag centre, or the arm's own calibration is "
-              "off). Touch exactly the tag centre; check the tip reads ~0 cm on the table.")
+          f"a spot placed from the others alone is off by {np.mean(misses) * 1000:.0f} mm on average, at most "
+          f"{max(misses) * 1000:.0f} mm (spot {worst + 1}) | printed tag {tag_mm:.1f} mm")
+    if err > 0.015 or max(misses) > 0.025:
+        if view is None:
+            print("NOT saved.")
+            return None
+        print(f"NOT saved: the touches do not agree well enough (spot {worst + 1} the most). Touch exactly the tag "
+              f"centre; check the tip reads ~0 cm on the table. (python robot/calibrate_env_camera.py --reuse "
+              f"--object <object> re-checks this attempt)")
         if own_view:
             view.close()
         return None
@@ -406,7 +428,8 @@ def save_depth_calibration(cfg, ec, centres, cam_centres, image_pts, K, fovy, si
         cfg["arms"][cfg["active_arm"]]["env_camera"] = {k: ec[k] for k in ("pos", "R", "fovy_used", "K", "depth")}
     CONFIG.write_text(json.dumps(cfg, indent=2))
     print("saved (depth calibration: the runner, tracking and checks now use the RealSense depth)")
-    view.show(camera=(pos, R))
+    if view is not None:
+        view.show(camera=(pos, R))
     if own_view:
         view.close()
     return dict(pos=pos, R=R, tag_mm=tag_mm, err_mm=err * 1000)
@@ -509,6 +532,8 @@ def main():
     ap.add_argument("--height", type=float, help="ruler mode: tag centre height, cm")
     ap.add_argument("--spots", type=int, default=4, help="touch mode: number of spots")
     ap.add_argument("--frames", type=int, default=15, help="frames averaged per spot")
+    ap.add_argument("--reuse", action="store_true",
+                    help="re-check the last depth calibration attempt (no touching again)")
     ap.add_argument("--tag-mm", type=float, help="the printed tag's black square measured with a ruler (mm): kept "
                                                   "as is instead of being guessed from the touches (steadier)")
     ap.add_argument("--track", action="store_true",
@@ -521,6 +546,14 @@ def main():
     ap.add_argument("--camera", type=int, help="track mode: this camera index instead of the environment camera")
     args = ap.parse_args()
     cfg = json.loads(CONFIG.read_text())
+    if args.reuse:
+        if not ATTEMPT.exists():
+            raise SystemExit("no saved depth calibration attempt yet")
+        a = json.loads(ATTEMPT.read_text())
+        print(f"re-checking the last depth calibration attempt ({len(a['world'])} spots)")
+        save_depth_calibration(cfg, cfg["env_camera"], np.array(a["world"]), np.array(a["camera"]),
+                               np.array(a["image"]), np.array(a["K"]), a["fovy"], a["sizes"], None, False, None)
+        return
     if args.tag_mm:
         cfg.update(tag_mm=args.tag_mm, tag_mm_measured=True)
         CONFIG.write_text(json.dumps(cfg, indent=2))
