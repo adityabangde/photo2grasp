@@ -138,6 +138,10 @@ class RealSense:
         self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
         self.align = rs.align(rs.stream.color)
         self._depth = None
+        i = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self.K = np.array([[i.fx, 0, i.ppx], [0, i.fy, i.ppy], [0, 0, 1.0]])  # factory lens values
+        self.fovy = float(np.degrees(2 * np.arctan(i.height / 2 / i.fy)))
+        self.serial = profile.get_device().get_info(rs.camera_info.serial_number)
         for _ in range(15):  # let auto exposure settle
             self.pipe.wait_for_frames()
 
@@ -149,5 +153,35 @@ class RealSense:
     def depth(self):
         return self._depth
 
+    def depth_m(self):
+        """The depth image of the last read(), in metres (0 = no reading)."""
+        return None if self._depth is None else self._depth.astype(np.float32) * self.depth_scale
+
     def close(self):
         self.pipe.stop()
+
+
+def tag_centre_3d(corners, depth_m, K, shrink=0.7):
+    """Where a detected tag's centre is in front of the camera (OpenCV camera frame, metres), measured with depth:
+    the median depth over the tag (its middle `shrink` part: edges mix with the background) at the centre pixel,
+    turned into 3D with the lens values. No printed tag size involved. None if the depth has no reading there."""
+    if depth_m is None:
+        return None
+    q = np.asarray(corners, np.float32)
+    centre = q.mean(0)
+    mask = np.zeros(depth_m.shape, np.uint8)
+    cv2.fillPoly(mask, [np.round(centre + (q - centre) * shrink).astype(np.int32)], 1)
+    z = depth_m[(mask > 0) & (depth_m > 0.1) & (depth_m < 3.0)]
+    if len(z) < 10:
+        return None
+    z = float(np.median(z))
+    return np.array([(centre[0] - K[0, 2]) / K[0, 0] * z, (centre[1] - K[1, 2]) / K[1, 1] * z, z])
+
+
+def open_env_camera(cfg):
+    """The environment camera as configured: the RealSense with depth (after a depth calibration) or an OpenCV
+    camera (its index, renumbering handled)."""
+    ec = cfg["env_camera"]
+    if ec.get("depth"):
+        return RealSense(ec["width"], ec["height"])
+    return Camera(camera_indices(cfg, need_wrist=False)[1], ec["width"], ec["height"], ec.get("fixed_exposure"))

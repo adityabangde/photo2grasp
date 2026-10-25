@@ -46,7 +46,7 @@ from train_tag import Actor  # noqa: E402
 
 from arm import SOArm  # noqa: E402
 from calibrate_env_camera import CONFIG, touch_calibrate  # noqa: E402
-from camera import Camera, camera_indices  # noqa: E402
+from camera import Camera, RealSense, camera_indices, tag_centre_3d  # noqa: E402
 from hand_watch import HandWatcher  # noqa: E402
 from sim_map import SimMap, require_arm_model  # noqa: E402
 from sim_mirror import Mirror  # noqa: E402
@@ -81,7 +81,8 @@ class TagTracker:
         ec = cfg.get("env_camera") or {}
         self.env_cal = "pos" in ec
         if self.env_cal:
-            self.K_env = intrinsics(ec["fovy_used"], ec["width"], ec["height"])
+            self.K_env = (np.array(ec["K"]) if ec.get("K")  # the RealSense's factory lens values
+                          else intrinsics(ec["fovy_used"], ec["width"], ec["height"]))
             self.env_pos, self.env_R = np.array(ec["pos"]), np.array(ec["R"])
 
     def reset(self):
@@ -96,7 +97,7 @@ class TagTracker:
         ok, rvec, tvec = cv2.solvePnP(self.obj, c, K, None, flags=cv2.SOLVEPNP_IPPE_SQUARE)
         return (c, rvec, tvec) if ok else None
 
-    def update(self, q_sim, wrist_bgr, env_bgr=None):
+    def update(self, q_sim, wrist_bgr, env_bgr=None, env_depth=None):
         """Joint angles (sim radians) + frames -> dict(visible, source, wrist/env corners, drift, orientation).
         The wrist camera's reading wins when both see a tag, as in training; drift = how far the two readings
         differ; orientation = (name, tilt deg) of the object, or None (no tag seen / glue roll not set up)."""
@@ -116,7 +117,9 @@ class TagTracker:
             found = self.find(env_bgr, self.back_id, self.K_env)
             if found:
                 ec, rvec, tvec = found
-                back = (self.env_pos + self.env_R @ tvec.ravel(), self.env_R @ cv2.Rodrigues(rvec)[0][:, 2])
+                seen = tag_centre_3d(ec, env_depth, self.K_env) if env_depth is not None else None
+                centre = seen if seen is not None else tvec.ravel()  # depth: the true distance, no tag size
+                back = (self.env_pos + self.env_R @ centre, self.env_R @ cv2.Rodrigues(rvec)[0][:, 2])
                 if turned is None and self.roll["back"] is not None:
                     turned = orientation(object_rotation(self.env_R @ cv2.Rodrigues(rvec)[0], True,
                                                          self.roll["back"]))
@@ -183,8 +186,12 @@ def main():
     index, env_index = camera_indices(cfg, need_wrist=not args.env_only)  # --env-only: no wrist camera needed
     cam = Camera(index, web["width"], web["height"], cc.get("fixed_exposure")) if index is not None else None
     ec = cfg.get("env_camera")
-    env_cam = Camera(env_index, ec["width"], ec["height"], ec.get("fixed_exposure")) \
-        if ec and "env_camera" in ck else None
+    env_cam = None
+    if ec and "env_camera" in ck:  # the RealSense with depth after a depth calibration, else an OpenCV camera
+        env_cam = RealSense(ec["width"], ec["height"]) if ec.get("depth") else \
+            Camera(env_index, ec["width"], ec["height"], ec.get("fixed_exposure"))
+        if ec.get("depth"):
+            print("environment camera: RealSense with depth (the tag's distance measured, not inferred)")
     if args.to_hand and ck.get("hand"):
         sys.exit("this model takes the object from a hand: --to-hand is for table pick-up models")
     tracker = TagTracker(ck, cfg, wrist_fovy, args.to_hand)
@@ -203,6 +210,9 @@ def main():
 
     def read_env():
         return cv2.cvtColor(env_cam.read(), cv2.COLOR_RGB2BGR) if env_cam else None
+
+    def env_depth():  # the depth image matching the last read_env() frame (RealSense), else None
+        return env_cam.depth_m() if hasattr(env_cam, "depth_m") else None
 
     model = tracker.env.model
     lo, hi = model.actuator_ctrlrange[:, 0], model.actuator_ctrlrange[:, 1]
@@ -275,7 +285,7 @@ def main():
         """The held object's bottom centre minus the gripper tip (robot frame), for scripted putting down."""
         e = tracker.env
         for _ in range(5):  # a fresh look at the held object (the last reading is from before the lift)
-            tracker.update(mapping.to_sim(arm.read_degrees()), read_wrist()[0], read_env())
+            tracker.update(mapping.to_sim(arm.read_degrees()), read_wrist()[0], read_env(), env_depth())
             if e.age == 0:
                 break
         if e.age == 0:  # the held object's bottom centre, from its front tag: half its thickness
@@ -378,7 +388,8 @@ def main():
                     if not move(goal, min_seconds=1.5, optional=True):
                         continue  # this look direction would bring the camera too close to the arm
                 for _ in range(ck.get("scan_frames", 3)):
-                    scan = tracker.update(mapping.to_sim(arm.read_degrees()), read_wrist()[0], read_env())
+                    scan = tracker.update(mapping.to_sim(arm.read_degrees()), read_wrist()[0], read_env(),
+                                          env_depth())
                     if scan["orientation"] and scan["orientation"][0] != "upright":
                         print(f"warning: the object looks {scan['orientation'][0]} (tilt {scan['orientation'][1]:.0f}"
                               f" deg): the model was trained on upright objects")
@@ -400,7 +411,7 @@ def main():
                 q = mapping.to_sim(arm.read_degrees())
                 wrist_in, frame = read_wrist()
                 env_frame = read_env()
-                seen = tracker.update(q, wrist_in, env_frame)
+                seen = tracker.update(q, wrist_in, env_frame, env_depth())
                 if seen["drift"] is not None:
                     drift.append(seen["drift"])
                 state = tracker.state(q, target, seen["visible"])

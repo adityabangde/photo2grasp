@@ -47,7 +47,7 @@ from tag_env import (ENV_CAMERA, TAG, TagLiftEnv, back_to_front, from_ruler, int
                      object_rotation, object_tags, orientation, ruler, save_tag_roll, tag_roll, vfov)
 
 from arm import SOArm  # noqa: E402
-from camera import Camera, RealSense, VideoFile, camera_indices  # noqa: E402
+from camera import Camera, RealSense, VideoFile, camera_indices, tag_centre_3d  # noqa: E402
 from hand_watch import HandWatcher, env_camera_pose  # noqa: E402
 from sim_map import MENAGERIE, ROBOT_XML, SIM_JOINTS, TIP_GEOMS, SimMap, arm_model, arm_placement  # noqa: E402
 
@@ -238,6 +238,17 @@ def solve_camera(centres, image_pts, K, tag_mm, fit_size=True):
     return pos, R, tag_mm, err_mm, W, I
 
 
+def rigid_fit(cam_pts, robot_pts):
+    """Rotation R and position t with robot = t + R @ camera for matched 3D points (Kabsch), and the mean
+    distance (m) between the fitted and the measured robot points."""
+    A, B = np.asarray(cam_pts, float), np.asarray(robot_pts, float)
+    ca, cb = A.mean(0), B.mean(0)
+    U, _, Vt = np.linalg.svd((A - ca).T @ (B - cb))
+    R = Vt.T @ np.diag([1, 1, np.sign(np.linalg.det(Vt.T @ U.T))]) @ U.T
+    t = cb - R @ ca
+    return t, R, float(np.linalg.norm(A @ R.T + t - B, axis=1).mean())
+
+
 def touch_calibrate(cam, arm, mapping, cfg, object_name="lego_tree", spots=4, frames=15, ruler_spots=None,
                     height_cm=None, view=None):
     """Interactive calibration with the camera window; updates and saves cfg (env_camera, tag_mm).
@@ -245,6 +256,10 @@ def touch_calibrate(cam, arm, mapping, cfg, object_name="lego_tree", spots=4, fr
     or None if the user quit."""
     ec = cfg["env_camera"]
     K, fovy = camera_intrinsics(ec)
+    use_depth = hasattr(cam, "depth_m") and ruler_spots is None  # RealSense: the tag's 3D position from depth
+    if use_depth:
+        K, fovy = cam.K, cam.fovy  # the camera's factory lens values
+        print(f"depth calibration with the RealSense (factory lens: {fovy:.1f} deg field of view)")
     sim = view.sim if view is not None else calibration_scene(object_name)  # arm kinematics + object thickness
     depth = sim.tag_depth  # tag ID 0 face to tag ID 1 face
     tips = [sim.model.geom(g).id for g in TIP_GEOMS[arm_model()]]
@@ -265,14 +280,14 @@ def touch_calibrate(cam, arm, mapping, cfg, object_name="lego_tree", spots=4, fr
     view = view or SimView(sim, arm, mapping)
     plan = ruler_spots or [None] * spots
     hints = ["near (close to the robot)", "far", "to one side", "to the other side"]
-    centres, image_pts = [], []
+    centres, image_pts, cam_centres, sizes = [], [], [], []
     for n, spot in enumerate(plan):
         if spot:
             print(f"spot {n + 1}/{len(plan)}: tag ID 0 face {spot[0]} cm in front, {spot[1]:+} cm sideways -> SPACE")
         else:
             print(f"spot {n + 1}/{len(plan)}: object {hints[n % 4]}, touch {touch} with the closed gripper tip "
                   "-> SPACE")
-        captured, touched = [], []
+        captured, touched, seen_3d = [], [], []
         while len(captured) < frames:
             frame = cv2.cvtColor(cam.read(), cv2.COLOR_RGB2BGR)
             c = find(frame)
@@ -288,6 +303,12 @@ def touch_calibrate(cam, arm, mapping, cfg, object_name="lego_tree", spots=4, fr
                 captured.append(c)
                 if tip is not None:
                     touched.append(tip)
+                if use_depth:
+                    point = tag_centre_3d(c, cam.depth_m(), K)
+                    if point is not None:
+                        seen_3d.append(point)
+                        side = np.linalg.norm(c - np.roll(c, 1, 0), axis=1).mean()
+                        sizes.append(side / K[1, 1] * point[2] * 1000)  # printed size from depth (mm)
             if captured:
                 msg = f"capturing {len(captured)}/{frames}, keep still"
             elif spot:
@@ -311,6 +332,14 @@ def touch_calibrate(cam, arm, mapping, cfg, object_name="lego_tree", spots=4, fr
             print(f"   touched point measured by the arm: front {f * 100:.1f} cm, side {sd * 100:+.1f} cm, "
                   f"height {h * 100:.1f} cm")
         image_pts.append(np.mean(captured, 0))
+        if use_depth:
+            if len(seen_3d) < frames // 2:
+                print("   no depth reading on the tag at this spot (too close / glare?): depth calibration needs it")
+                if own_view:
+                    view.close()
+                return None
+            cam_centres.append(np.median(seen_3d, 0))
+            print(f"   camera sees the tag {np.median(seen_3d, 0)[2] * 100:.1f} cm away (depth)")
 
     spread = max(np.linalg.norm(a - b) for a in centres for b in centres)
     if spread < 0.04:  # the touched spots must be spread out, or the arm being read did not move
@@ -320,6 +349,8 @@ def touch_calibrate(cam, arm, mapping, cfg, object_name="lego_tree", spots=4, fr
         if own_view:
             view.close()
         return None
+    if use_depth:
+        return save_depth_calibration(cfg, ec, centres, cam_centres, image_pts, K, fovy, sizes, view, own_view, cam)
     tag_mm = cfg.get("tag_mm", TAG["size"] * 1000)
     fit_size = ruler_spots is None and not cfg.get("tag_mm_measured")  # a ruler-measured tag size is kept as is
     pos, R, fitted_mm, err_mm, W, I = solve_camera(centres, image_pts, K, tag_mm, fit_size=fit_size)
@@ -348,6 +379,39 @@ def touch_calibrate(cam, arm, mapping, cfg, object_name="lego_tree", spots=4, fr
     return dict(pos=pos, R=R, tag_mm=tag_mm, err_mm=err_mm)
 
 
+def save_depth_calibration(cfg, ec, centres, cam_centres, image_pts, K, fovy, sizes, view, own_view, cam):
+    """Camera pose from matched 3D points (tag centre seen with depth <-> the same point from the arm), with a
+    stability check: the camera estimate without each spot in turn."""
+    pos, R, err = rigid_fit(cam_centres, centres)
+    moves = [np.linalg.norm(rigid_fit([c for j, c in enumerate(cam_centres) if j != k],
+                                      [c for j, c in enumerate(centres) if j != k])[0] - pos)
+             for k in range(len(centres))] if len(centres) > 3 else [0.0]
+    tag_mm = float(np.median(sizes))
+    cf, cs, ch = ruler(pos)
+    print(f"camera {cf * 100:.1f} cm in front of the rotation axis, {cs * 100:+.1f} cm sideways, {ch * 100:.1f} cm "
+          f"high, looking {np.degrees(np.arcsin(-R[2, 2])):.0f} deg down | fit error {err * 1000:.0f} mm | "
+          f"stable within {max(moves) * 100:.1f} cm (leaving out any one spot) | printed tag {tag_mm:.1f} mm")
+    if err > 0.015 or max(moves) > 0.03:
+        print("NOT saved: the touches do not agree (a spot was off the tag centre, or the arm's own calibration is "
+              "off). Touch exactly the tag centre; check the tip reads ~0 cm on the table.")
+        if own_view:
+            view.close()
+        return None
+    ec.update(pos=pos.round(4).tolist(), R=R.round(5).tolist(), fovy_used=round(fovy, 2), K=np.round(K, 3).tolist(),
+              depth=True, realsense=getattr(cam, "serial", None),
+              calib_points=dict(world=np.round(centres, 5).tolist(), camera=np.round(cam_centres, 5).tolist(),
+                                image=np.round(image_pts, 2).tolist(), tag_mm=round(tag_mm, 2)))
+    cfg.update(tag_mm=round(tag_mm, 2), tag_mm_measured=True)
+    if cfg.get("active_arm") in cfg.get("arms", {}):  # measured from this arm's base: kept per arm as well
+        cfg["arms"][cfg["active_arm"]]["env_camera"] = {k: ec[k] for k in ("pos", "R", "fovy_used", "K", "depth")}
+    CONFIG.write_text(json.dumps(cfg, indent=2))
+    print("saved (depth calibration: the runner, tracking and checks now use the RealSense depth)")
+    view.show(camera=(pos, R))
+    if own_view:
+        view.close()
+    return dict(pos=pos, R=R, tag_mm=tag_mm, err_mm=err * 1000)
+
+
 def live_check(cam, cfg, object_name, view=None, watch=None):
     """Show live where the calibrated camera sees the object (robot-side face, from the rotation axis) [and the
     person's hand, with a HandWatcher], in the camera window and in the sim."""
@@ -356,7 +420,7 @@ def live_check(cam, cfg, object_name, view=None, watch=None):
     front_id, back_id = object_tags(object_name)
     find = None
     if calibrated and back_id is not None:
-        K = intrinsics(ec["fovy_used"], ec["width"], ec["height"])
+        K = np.array(ec["K"]) if ec.get("K") else intrinsics(ec["fovy_used"], ec["width"], ec["height"])
         sim = view.sim if view is not None else calibration_scene(object_name)
         depth = sim.tag_depth
         local = {"front": sim.model.geom_pos[sim.tag_geom].copy(),  # tag centres in the object's frame
@@ -381,7 +445,9 @@ def live_check(cam, cfg, object_name, view=None, watch=None):
                 ok, rv, tv = cv2.solvePnP(obj, c, K, None, flags=cv2.SOLVEPNP_IPPE_SQUARE)
                 if ok:
                     pos, R = camera
-                    face, normal = back_to_front(pos + R @ tv.ravel(), R @ cv2.Rodrigues(rv)[0][:, 2], depth)
+                    seen = tag_centre_3d(c, cam.depth_m(), K) if hasattr(cam, "depth_m") else None
+                    centre = seen if seen is not None else tv.ravel()  # depth: true distance, no tag size involved
+                    face, normal = back_to_front(pos + R @ centre, R @ cv2.Rodrigues(rv)[0][:, 2], depth)
                     yaw = np.arctan2(-normal[0], normal[1])  # object turned so its robot-side face points along it
                     f, sd, h = ruler(face)
                     lines[-1] = (f"object face: front {f * 100:5.1f} cm  side {sd * 100:+5.1f} cm  "
@@ -448,7 +514,9 @@ def main():
     ap.add_argument("--track", action="store_true",
                     help="no calibration: track the object live with the saved calibration (sim follows it)")
     ap.add_argument("--hand", help="track mode: also track this person's hand (hands/<name>)")
-    ap.add_argument("--depth", action="store_true", help="track mode: RealSense depth for the hand's distance")
+    ap.add_argument("--depth", action="store_true",
+                    help="RealSense depth: calibrate with true 3D tag positions (no tag size, factory lens); "
+                         "track mode: also the hand's distance")
     ap.add_argument("--video", help="track mode: a recorded video instead of the environment camera")
     ap.add_argument("--camera", type=int, help="track mode: this camera index instead of the environment camera")
     args = ap.parse_args()
@@ -472,10 +540,11 @@ def main():
             arm = mapping = None
     if args.video:
         cam = VideoFile(args.video)
-    elif args.depth:
+    elif args.depth or (ec.get("depth") and args.camera is None):
         cam = RealSense(ec["width"], ec["height"])
     else:
-        cam = Camera(camera_indices(cfg, need_wrist=False)[1] if args.camera is None else args.camera, ec["width"], ec["height"],
+        index = camera_indices(cfg, need_wrist=False)[1] if args.camera is None else args.camera
+        cam = Camera(index, ec["width"], ec["height"],
                      ec.get("fixed_exposure"))
     if arm_model() == "so100":
         sim = TagLiftEnv(args.object, domain_randomization=False, hand=args.hand, hand_role="to")

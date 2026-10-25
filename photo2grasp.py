@@ -396,6 +396,8 @@ def main():
     k = sub.add_parser("calibrate", help="environment camera position (touch the tag with the gripper)")
     k.add_argument("name", nargs="?", default="lego_tree")
     k.add_argument("--tag-mm", type=float, help="the tag's black square measured with a ruler, mm (steadier)")
+    k.add_argument("--depth", action="store_true", help="RealSense depth: true 3D tag positions (most accurate)")
+    k.add_argument("--spots", type=int, help="number of touches (default 4)")
     tr = sub.add_parser("track", help="live preview: move the real objects (and your hand), the sim follows")
     tr.add_argument("names", nargs="*", default=["lego_tree"], help="one or several objects")
     tr.add_argument("--all", action="store_true", help="every object whose tag IDs are set")
@@ -483,7 +485,8 @@ def main():
     elif args.step == "calibrate":
         ensure_robot()
         call("robot/calibrate_env_camera.py", "--object", args.name,
-             *(["--tag-mm", args.tag_mm] if args.tag_mm else []))
+             *(["--tag-mm", args.tag_mm] if args.tag_mm else []), *(["--depth"] if args.depth else []),
+             *(["--spots", args.spots] if args.spots else []))
     elif args.step == "track":
         extra = [*(["--depth"] if args.depth else []), *(["--video", Path(args.video).resolve()] if args.video else []),
                  *(["--camera", args.camera] if args.camera is not None else [])]

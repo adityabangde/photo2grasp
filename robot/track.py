@@ -34,7 +34,7 @@ from lift_env import ARM_JOINTS, ARM_SCENE, front_face_y  # noqa: E402
 from tag_env import (TAG, intrinsics, measured_roll, object_rotation, object_setup, object_tags,  # noqa: E402
                      orientation, ruler, save_tag_roll, tag_png, tag_roll)
 
-from camera import Camera, RealSense, VideoFile, camera_indices  # noqa: E402
+from camera import Camera, RealSense, VideoFile, camera_indices, tag_centre_3d  # noqa: E402
 from hand_watch import HandWatcher  # noqa: E402
 
 CONFIG = Path(__file__).parent / "config.json"
@@ -146,7 +146,7 @@ class Tracker:
         if "pos" not in ec:
             raise SystemExit("environment camera not calibrated yet: python photo2grasp.py calibrate <object>")
         self.scene, self.pos, self.R = scene, np.array(ec["pos"]), np.array(ec["R"])
-        self.K = intrinsics(ec["fovy_used"], width, height)
+        self.K = np.array(ec["K"]) if ec.get("K") else intrinsics(ec["fovy_used"], width, height)
         s = cfg.get("tag_mm", TAG["size"] * 1000) / 2000
         self.pts = np.array([[-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]], np.float32)  # OpenCV corner order
         self.detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(TAG["dictionary"]),
@@ -156,7 +156,7 @@ class Tracker:
         self.last_seen = {n: -1e9 for n in scene.names}
         self.tag_rotations = {}  # this frame: {(name, side): tag rotation}, for "u"
 
-    def __call__(self, frame_bgr, now):
+    def __call__(self, frame_bgr, now, depth=None):
         """Moves the sim objects; returns {name: text line}."""
         corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY))
         raw = {int(i): c[0] for i, c in zip(ids.ravel(), corners)} if ids is not None else {}
@@ -169,7 +169,9 @@ class Tracker:
                 if tag_id in raw:
                     ok, rv, tv = cv2.solvePnP(self.pts, raw[tag_id], self.K, None, flags=cv2.SOLVEPNP_IPPE_SQUARE)
                     if ok:
-                        seen[side] = (self.R @ cv2.Rodrigues(rv)[0], self.pos + self.R @ tv.ravel())
+                        centre = tag_centre_3d(raw[tag_id], depth, self.K) if depth is not None else None
+                        centre = centre if centre is not None else tv.ravel()  # depth: measured distance
+                        seen[side] = (self.R @ cv2.Rodrigues(rv)[0], self.pos + self.R @ centre)
                         self.tag_rotations[(n, side)] = seen[side][0]
             for side in [s for s in seen if self.roll[n][s] is None]:  # first sight: assume it stands, glued square
                 self.keep_roll(n, side, 90 * round(measured_roll(seen[side][0]) / 90))
@@ -259,10 +261,11 @@ def main():
     ec = cfg["env_camera"]
     if args.video:
         cam = VideoFile(args.video)
-    elif args.depth:
+    elif args.depth or (ec.get("depth") and args.camera is None):
         cam = RealSense(ec["width"], ec["height"])
     else:
-        cam = Camera(camera_indices(cfg, need_wrist=False)[1] if args.camera is None else args.camera, ec["width"], ec["height"],
+        index = camera_indices(cfg, need_wrist=False)[1] if args.camera is None else args.camera
+        cam = Camera(index, ec["width"], ec["height"],
                      ec.get("fixed_exposure"))
     h, w = cam.read().shape[:2]
     track = Tracker(scene, cfg, w, h)
@@ -297,7 +300,8 @@ def main():
                 elif now - hand_seen > UNSEEN_S:
                     smooth = None
                     (scene.stick or scene.hand).park(scene.data)
-            lines = list(track(frame, now).values()) + ([hand_line] if hand_line else [])
+            depth = cam.depth_m() if hasattr(cam, "depth_m") else None
+            lines = list(track(frame, now, depth).values()) + ([hand_line] if hand_line else [])
             if scene.stick is not None and smooth is not None:  # an object resting on the hand: not into it
                 for n in scene.names:
                     if scene.data.qpos[scene.obj_qadr[n]] < 1.0:  # on the table, not parked
