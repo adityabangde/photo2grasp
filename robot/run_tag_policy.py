@@ -5,6 +5,7 @@
     python robot/run_tag_policy.py runs/tag_.../actor_last.pt --env-only    # environment camera only
     python robot/run_tag_policy.py runs/tag_.../actor_last.pt --to-hand my_hand   # then put it on your palm
     python robot/run_tag_policy.py runs/tag_.../actor_last.pt --place 20 12        # then put it down there
+    python robot/run_tag_policy.py runs/tag_.../actor_last.pt --tags 6 7           # same, other tag IDs
 
 Every 0.1 s, exactly as in training (tag_env.py):
   camera frames -> AprilTag detector -> solvePnP (printed tag size + lens) -> tag position in the robot frame
@@ -58,17 +59,20 @@ MIN_TIP_HEIGHT, MAX_REACH = 0.005, 0.40  # m: gripper tip above the table, horiz
 class TagTracker:
     """Real-robot version of the simulated detection: same maths, same memory, same policy input."""
 
-    def __init__(self, ck, cfg, wrist_fovy, to_hand=None):
+    def __init__(self, ck, cfg, wrist_fovy, to_hand=None, object_name=None):
+        """object_name: the object really there, if not the one the model was trained on (its tags, thickness and
+        tag height are used; the model still acts as trained)."""
         self.ck = ck
         hand, role = (to_hand, "to") if to_hand else (ck.get("hand"), "from")
-        self.env = TagLiftEnv(ck.get("object", "lego_tree"), domain_randomization=False, start=ck["start"],
+        object_name = object_name or ck.get("object", "lego_tree")
+        self.env = TagLiftEnv(object_name, domain_randomization=False, start=ck["start"],
                               area=ck.get("area"), hand=hand, hand_role=role)  # same object, area [and hand]
         self.env.calib_pos, self.env.calib_rot = np.zeros(3), np.eye(3)
         self.env.min_camera_clearance = ck.get("min_camera_clearance", OLD_POLICY_CLEARANCE)  # as in its training
         self.K = intrinsics(wrist_fovy, ck["webcam"]["width"], ck["webcam"]["height"])
         self.depth = self.env.tag_depth  # this object's thickness between its tags (from its asset)
-        self.front_id, self.back_id = object_tags(ck.get("object", "lego_tree"))  # IDs glued on this object
-        self.roll = tag_roll(ck.get("object", "lego_tree"))  # how they are glued (for the object's orientation)
+        self.front_id, self.back_id = object_tags(object_name)  # IDs glued on this object
+        self.roll = tag_roll(object_name)  # how they are glued (for the object's orientation)
         self.tips = [self.env.model.geom(g).id for g in ("fixed_jaw_pad_1", "moving_jaw_pad_1")]
         self.detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(TAG["dictionary"]),
                                                 cv2.aruco.DetectorParameters())
@@ -163,6 +167,10 @@ def main():
     p.add_argument("--env-only", action="store_true", help="use only the environment camera")
     p.add_argument("--move-speed", type=float, default=20.0, help="max joint speed for start/return moves, deg/s")
     p.add_argument("--to-hand", help="after a pick-up, put the object on this person's open palm (hands/<name>)")
+    p.add_argument("--tags", nargs=2, type=int, metavar=("FRONT", "BACK"),
+                   help="look for these tag IDs instead of the object's own (everything else as the model's object)")
+    p.add_argument("--object", help="the object really there, if not the model's own (e.g. the tree model on the "
+                                    "box): its tags, thickness and tag height are used")
     p.add_argument("--place", nargs=2, type=float, metavar=("FRONT", "SIDE"),
                    help="after a pick-up, put the object down here on the table (cm from the rotation axis, side + = "
                         "the robot's left)")
@@ -174,7 +182,10 @@ def main():
     actor.load_state_dict(ck["actor"])
     actor.eval()
     action_scale = np.array(ck["action_scale"])
-    object_name = ck.get("object", "lego_tree")
+    object_name = args.object or ck.get("object", "lego_tree")
+    if args.object and args.object != ck.get("object", "lego_tree"):
+        print(f"running the {ck.get('object', 'lego_tree')} model on the {args.object} (its tags "
+              f"{object_tags(args.object)}): expect lower success than with its own model")
 
     require_arm_model(ck.get("arm_model", "so100"), "this trained model")  # older models: SO-100
     arm = SOArm(cfg["port"], ROOT / cfg["calibration"], cfg["baudrate"])
@@ -194,7 +205,10 @@ def main():
             print("environment camera: RealSense with depth (the tag's distance measured, not inferred)")
     if args.to_hand and ck.get("hand"):
         sys.exit("this model takes the object from a hand: --to-hand is for table pick-up models")
-    tracker = TagTracker(ck, cfg, wrist_fovy, args.to_hand)
+    tracker = TagTracker(ck, cfg, wrist_fovy, args.to_hand, object_name)
+    if args.tags:  # only the IDs change: the object's size, thickness and tag height stay the model's
+        tracker.front_id, tracker.back_id = args.tags
+        print(f"looking for tags {args.tags[0]} (robot side) and {args.tags[1]} (camera side)")
     if args.to_hand and not (env_cam and tracker.env_cal):
         sys.exit("--to-hand needs the calibrated environment camera (it finds the hand): photo2grasp.py calibrate")
     if env_cam and not tracker.env_cal:
@@ -369,7 +383,8 @@ def main():
             while True:
                 key = input(f"\nAttempt {ep + 1}: place the {object_name} {a['front_min'] * 100:.0f}-"
                             f"{a['front_max'] * 100:.0f} cm in front of the rotation axis, +-{a['side'] * 100:.0f} cm "
-                            f"sideways, tag ID 0 facing the robot. ENTER = go | c = re-calibrate camera | q = quit: ")
+                            f"sideways, tag ID {tracker.front_id} facing the robot. ENTER = go | c = re-calibrate camera | "
+                            f"q = quit: ")
                 if key.strip().lower() == "c":
                     recalibrate()
                     continue
