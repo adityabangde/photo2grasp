@@ -4,6 +4,7 @@
     python robot/run_tag_policy.py runs/tag_.../actor_last.pt --speed 0.3   # real run, slow
     python robot/run_tag_policy.py runs/tag_.../actor_last.pt --env-only    # environment camera only
     python robot/run_tag_policy.py runs/tag_.../actor_last.pt --to-hand my_hand   # then put it on your palm
+    python robot/run_tag_policy.py runs/tag_.../actor_last.pt --place 20 12        # then put it down there
 
 Every 0.1 s, exactly as in training (tag_env.py):
   camera frames -> AprilTag detector -> solvePnP (printed tag size + lens) -> tag position in the robot frame
@@ -39,8 +40,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "sim2real"))
 from place_on_hand import plan  # noqa: E402
 from tag_env import (MIN_CAMERA_CLEARANCE, OLD_POLICY_CLEARANCE, SAFE_REST, TAG, TagLiftEnv,  # noqa: E402
-                     back_to_front, intrinsics, object_rotation, object_tags, orientation, pose_clearance, ruler,
-                     safe_route, tag_roll, tag_state, vfov)
+                     back_to_front, from_ruler, intrinsics, object_rotation, object_tags, orientation, pose_clearance,
+                     ruler, safe_route, tag_roll, tag_state, vfov)
 from train_tag import Actor  # noqa: E402
 
 from arm import SOArm  # noqa: E402
@@ -159,6 +160,9 @@ def main():
     p.add_argument("--env-only", action="store_true", help="use only the environment camera")
     p.add_argument("--move-speed", type=float, default=20.0, help="max joint speed for start/return moves, deg/s")
     p.add_argument("--to-hand", help="after a pick-up, put the object on this person's open palm (hands/<name>)")
+    p.add_argument("--place", nargs=2, type=float, metavar=("FRONT", "SIDE"),
+                   help="after a pick-up, put the object down here on the table (cm from the rotation axis, side + = "
+                        "the robot's left)")
     args = p.parse_args()
 
     cfg = json.loads(CONFIG.read_text())
@@ -267,8 +271,8 @@ def main():
             return None
         return np.median(tops, 0)
 
-    def put_on_hand(q_hold):
-        """Scripted placing on the person's palm; returns True when the object was let go on it."""
+    def held_offset(q_hold):
+        """The held object's bottom centre minus the gripper tip (robot frame), for scripted putting down."""
         e = tracker.env
         for _ in range(5):  # a fresh look at the held object (the last reading is from before the lift)
             tracker.update(mapping.to_sim(arm.read_degrees()), read_wrist()[0], read_env())
@@ -280,6 +284,25 @@ def main():
             offset = bottom - tracker.tip(q_hold)
         else:  # not seen lately: the gripper holds it about at its tag's height
             offset = np.array([0, 0, -e.tag_height])
+        return offset
+
+    def put_down(q_hold, front_cm, side_cm):
+        """Scripted placing on the table at (front, side) cm from the rotation axis; True when let go there."""
+        spot = from_ruler(front_cm / 100, side_cm / 100, 0.0)
+        try:
+            waypoints = plan(tracker.env, q_hold, spot, held_offset(q_hold))
+        except ValueError as err:
+            print(f"   cannot place at front {front_cm} cm, side {side_cm:+} cm: {err}")
+            return False
+        for _, q in waypoints:
+            move(q, min_seconds=2.0)
+        print(f"   placed at front {front_cm} cm, side {side_cm:+} cm")
+        return True
+
+    def put_on_hand(q_hold):
+        """Scripted placing on the person's palm; returns True when the object was let go on it."""
+        e = tracker.env
+        offset = held_offset(q_hold)
         while True:
             answer = input("hold your OPEN hand out, palm up, low (4-8 cm above the table) in front of the robot, "
                            "keep it still. ENTER = go | s = skip (keep holding the object): ").strip().lower()
@@ -430,6 +453,10 @@ def main():
                 mover.current = target
                 if args.to_hand:
                     put_on_hand(target.copy())
+                elif args.place:
+                    if input(f"place it at front {args.place[0]:g} cm, side {args.place[1]:+g} cm? ENTER = yes | "
+                             f"s = skip: ").strip().lower() != "s":
+                        put_down(target.copy(), *args.place)
                 print("attempt done, returning slowly to the look pose")
                 move(start)
         print(f"logs: {log_dir}")
