@@ -1,0 +1,34 @@
+{
+  "source": "Small kraft cardboard cube ('YOU DROPPED THIS KING' box). Not identifiable online (generic shipping box, label unreadable). Size estimated from the video with its AprilTags as a ruler (faces ~40-52 mm): ~5 cm cube - measure with a ruler to confirm. Mass: empty small kraft box ~30 g (estimate, weigh to confirm). Friction: cardboard on cloth ~0.5",
+  "size_m": [
+    0.05,
+    0.05,
+    0.05
+  ],
+  "mass_kg": 0.03,
+  "material": "kraft cardboard box (empty)",
+  "friction": [
+    0.5,
+    0.005,
+    0.0001
+  ],
+  "collision": "box",
+  "tags": {
+    "front": 6,
+    "back": 7
+  },
+  "tag_height_m": 0.022,
+  "center_of_mass": [
+    0.0,
+    0.0,
+    0.025
+  ],
+  "collision_pieces": 1,
+  "collision_accuracy": {
+    "overshoot_mm_p95": 5.71,
+    "overshoot_mm_max": 20.22,
+    "undershoot_mm_p95": 0.0,
+    "undershoot_mm_max": 0.0,
+    "surface_within_1mm_pct": 100.0
+  }
+}
