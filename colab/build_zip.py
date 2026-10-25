@@ -4,6 +4,8 @@ notebook colab/<object>_train.ipynb (the Colab cell).
     python colab/build_zip.py                                                   # Lego tree, default area
     python colab/build_zip.py --object celsius_can --area wide --init runs/tag_envcam_2250k
     python colab/build_zip.py --object celsius_can --hand my_hand --init runs/tag_envcam_2250k   # from a hand
+    python colab/build_zip.py --init runs/tag_envcam_2250k --env-camera --steps 500000   # fine-tune for the
+                                                                    # current env camera calibration
 
 The training options are stored in the zip (train_args.txt), so the Colab cell needs no editing; with --init
 the starting model's weights are packed too. Then follow the steps at the top of colab/colab_cell.py.
@@ -23,6 +25,8 @@ def main():
     ap.add_argument("--init", help="run dir with train_state.pt to start from")
     ap.add_argument("--steps", type=int, help="total training steps (default: the trainer's)")
     ap.add_argument("--hand", help="take the object from this person's hand (hands/<name>)")
+    ap.add_argument("--env-camera", action="store_true",
+                    help="train with the env camera where robot/config.json's calibration puts it")
     args = ap.parse_args()
 
     files = [ROOT / "sim2real" / n for n in ("lift_env.py", "tag_env.py", "hand_sim.py", "train_tag.py",
@@ -41,13 +45,22 @@ def main():
     task = f"{args.object}_from_{args.hand}" if args.hand else args.object
     total = args.steps or 1_000_000  # the Colab cell's default
     label = f"{total // 1_000_000}m" if total % 1_000_000 == 0 else f"{total // 1000}k"
-    out = ROOT / "colab" / (f"{task}_{label}_train.zip" if args.steps else f"{task}_train.zip")
+    if args.env_camera:
+        ec = json.loads((ROOT / "robot" / "config.json").read_text())["env_camera"]
+        if "pos" not in ec:
+            raise SystemExit("robot/config.json has no env camera calibration: calibrate it first")
+        calib = {k: ec[k] for k in ("pos", "R", "K", "fovy_used", "width", "height", "depth") if k in ec}
+        train_args += " --env-camera ../env_camera.json"
+    out = ROOT / "colab" / (f"{task}{'_calib' if args.env_camera else ''}_{label}_train.zip" if args.steps
+                            else f"{task}_train.zip")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for f in files:
             z.write(f, f.relative_to(ROOT).as_posix())
         if args.init:
             z.write(Path(args.init) / "train_state.pt", "init/train_state.pt")
             train_args += " --init ../init"
+        if args.env_camera:
+            z.writestr("env_camera.json", json.dumps(calib, indent=1))
         z.writestr("train_args.txt", train_args)
     cell = (ROOT / "colab" / "colab_cell.py").read_text(encoding="utf-8")
     notebook = {"nbformat": 4, "nbformat_minor": 5, "metadata": {"colab": {"provenance": []},

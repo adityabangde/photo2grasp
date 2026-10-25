@@ -75,6 +75,20 @@ def vfov(hfov, width, height):
     return float(np.degrees(2 * np.arctan(np.tan(np.radians(hfov) / 2) * height / width)))
 
 
+def use_env_camera(calib, pos_noise=0.03, target_noise=0.02, hfov_noise=2.0):
+    """Centre the training env camera on a real calibration (robot/config.json "env_camera": pos, R, K): the
+    measured mount and lens instead of the rough guess, with small randomization left for re-placing it."""
+    pos, R = np.array(calib["pos"], float), np.array(calib["R"], float)
+    axis = R[:, 2]  # optical axis in the robot frame
+    reach = (pos[2] - 0.03) / -axis[2] if axis[2] < -0.05 else 0.4  # where it meets the work area (3 cm up)
+    w, h = calib["width"], calib["height"]
+    K = np.array(calib["K"]) if calib.get("K") else intrinsics(calib["fovy_used"], w, h)
+    ENV_CAMERA.update(width=w, height=h, hfov=float(np.degrees(2 * np.arctan(w / 2 / K[0, 0]))),
+                      pos=pos.round(4).tolist(), target=(pos + reach * axis).round(4).tolist(),
+                      pos_noise=[pos_noise] * 3, target_noise=target_noise, hfov_noise=hfov_noise, calibrated=True)
+    return ENV_CAMERA
+
+
 def intrinsics(fovy_deg, width, height):
     f = (height / 2) / np.tan(np.radians(fovy_deg) / 2)
     return np.array([[f, 0, width / 2], [0, f, height / 2], [0, 0, 1]])

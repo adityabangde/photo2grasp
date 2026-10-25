@@ -5,6 +5,8 @@
                                                          # starting from a trained model (learns much faster)
     python sim2real/train_tag.py --object celsius_can --hand my_hand --init runs/tag_envcam_2250k
                                                          # take the object from a person's open hand
+    python sim2real/train_tag.py --init runs/tag_envcam_2250k --env-camera env_camera.json --steps 500000
+                                                         # fine-tune for the real, calibrated env camera
 
 Actor: policy input from tag_env.tag_state (joints, targets, tag estimate, seen flags).
 Critic: same + privileged sim state (asymmetric actor-critic, as in train_sac.py).
@@ -12,6 +14,7 @@ Writes runs/tag_<time>/: actor_best.pt, actor_last.pt, log.csv.
 """
 import argparse
 import csv
+import json
 import time
 from pathlib import Path
 
@@ -23,7 +26,7 @@ import torch.nn.functional as F
 from find_look_pose import look_pose
 from hand_sim import load_hand
 from tag_env import (BACK_TAG_ID, DEFAULT_AREA, ENV_CAMERA, HAND_AREA, SCAN_FRAMES, SCAN_TURNS, SETUP_VERSION, TAG,
-                     WEBCAM, WIDE_AREA, TagLiftEnv, check_object)
+                     WEBCAM, WIDE_AREA, TagLiftEnv, check_object, use_env_camera)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -119,7 +122,13 @@ def main():
     p.add_argument("--init", help="run dir (train_state.pt): start from its weights, e.g. for a new object")
     p.add_argument("--force", action="store_true", help="train even if the object looks hard to grasp")
     p.add_argument("--hand", help="take the object from this person's open hand (hands/<name>), area HAND_AREA")
+    p.add_argument("--env-camera", help="JSON of a real env camera calibration (robot/config.json env_camera): "
+                                        "train with the camera where it really is, not the rough guess")
     args = p.parse_args()
+    if args.env_camera:
+        e = use_env_camera(json.loads(Path(args.env_camera).read_text()))
+        print(f"env camera from the calibration: pos {e['pos']}, looking at {e['target']}, "
+              f"{e['hfov']:.1f} deg wide (randomized +-{e['pos_noise'][0] * 100:.0f} cm)", flush=True)
     problems = check_object(args.object)
     if problems:
         print("object check: " + "; ".join(problems))
