@@ -395,6 +395,7 @@ def main():
     r.add_argument("--all", action="store_true", help="go through every step")
     k = sub.add_parser("calibrate", help="environment camera position (touch the tag with the gripper)")
     k.add_argument("name", nargs="?", default="lego_tree")
+    k.add_argument("--tag-mm", type=float, help="the tag's black square measured with a ruler, mm (steadier)")
     tr = sub.add_parser("track", help="live preview: move the real objects (and your hand), the sim follows")
     tr.add_argument("names", nargs="*", default=["lego_tree"], help="one or several objects")
     tr.add_argument("--all", action="store_true", help="every object whose tag IDs are set")
@@ -481,7 +482,8 @@ def main():
         robot_setup(force=args.all)
     elif args.step == "calibrate":
         ensure_robot()
-        call("robot/calibrate_env_camera.py", "--object", args.name)
+        call("robot/calibrate_env_camera.py", "--object", args.name,
+             *(["--tag-mm", args.tag_mm] if args.tag_mm else []))
     elif args.step == "track":
         extra = [*(["--depth"] if args.depth else []), *(["--video", Path(args.video).resolve()] if args.video else []),
                  *(["--camera", args.camera] if args.camera is not None else [])]
@@ -489,7 +491,8 @@ def main():
             hand = ["--hand"] if args.hand == "stick" else ["--hand", args.hand] if args.hand else []
             call("robot/track.py", *(["--all"] if args.all else args.names), *hand, *extra)
         elif args.hand == "stick":
-            raise SystemExit("the stick hand needs the calibrated environment camera: photo2grasp.py calibrate <object>")
+            raise SystemExit("the stick hand needs the calibrated environment camera: "
+                             "photo2grasp.py calibrate <object>")
         else:  # not calibrated: one object, camera assumed at its planned spot (enough to try the hand)
             call("robot/calibrate_env_camera.py", "--object", args.names[0], "--track",
                  *(["--hand", args.hand] if args.hand else []), *extra)

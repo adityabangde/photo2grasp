@@ -321,7 +321,10 @@ def touch_calibrate(cam, arm, mapping, cfg, object_name="lego_tree", spots=4, fr
             view.close()
         return None
     tag_mm = cfg.get("tag_mm", TAG["size"] * 1000)
-    pos, R, fitted_mm, err_mm, W, I = solve_camera(centres, image_pts, K, tag_mm, fit_size=ruler_spots is None)
+    fit_size = ruler_spots is None and not cfg.get("tag_mm_measured")  # a ruler-measured tag size is kept as is
+    pos, R, fitted_mm, err_mm, W, I = solve_camera(centres, image_pts, K, tag_mm, fit_size=fit_size)
+    if not fit_size:
+        print(f"   printed tag size kept at {tag_mm:.1f} mm (measured with a ruler)")
     if not 0.7 < fitted_mm / tag_mm < 1.4 or err_mm > 30:  # a real print is never that far off
         print(f"NOT saved: the result makes no sense (printed tag {fitted_mm:.0f} mm, fit error {err_mm:.0f} mm). "
               f"Was the tip exactly on the tag centre at every spot, with the active arm?")
@@ -440,6 +443,8 @@ def main():
     ap.add_argument("--height", type=float, help="ruler mode: tag centre height, cm")
     ap.add_argument("--spots", type=int, default=4, help="touch mode: number of spots")
     ap.add_argument("--frames", type=int, default=15, help="frames averaged per spot")
+    ap.add_argument("--tag-mm", type=float, help="the printed tag's black square measured with a ruler (mm): kept "
+                                                  "as is instead of being guessed from the touches (steadier)")
     ap.add_argument("--track", action="store_true",
                     help="no calibration: track the object live with the saved calibration (sim follows it)")
     ap.add_argument("--hand", help="track mode: also track this person's hand (hands/<name>)")
@@ -448,6 +453,10 @@ def main():
     ap.add_argument("--camera", type=int, help="track mode: this camera index instead of the environment camera")
     args = ap.parse_args()
     cfg = json.loads(CONFIG.read_text())
+    if args.tag_mm:
+        cfg.update(tag_mm=args.tag_mm, tag_mm_measured=True)
+        CONFIG.write_text(json.dumps(cfg, indent=2))
+        print(f"printed tag size set to {args.tag_mm} mm (measured); calibrations keep it from now on")
     ec = cfg["env_camera"]
     arm = mapping = None
     if not args.ruler:  # the arm is read (torque off) so the sim arm copies it
