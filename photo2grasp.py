@@ -360,6 +360,8 @@ def main():
     a = sub.add_parser("asset", help="videos/photos -> MuJoCo object")
     a.add_argument("name")
     a.add_argument("inputs", nargs="+")
+    a.add_argument("--nemotron", action="store_true",
+                   help="real size/weight: NVIDIA Nemotron (Nebius) reads the photos, Tavily searches the web")
     hd = sub.add_parser("hand", help="videos/photos (or a webcam) of your open hand -> your hand in the sim")
     hd.add_argument("name")
     hd.add_argument("inputs", nargs="*")
@@ -425,7 +427,8 @@ def main():
     args = ap.parse_args()
 
     if args.step == "asset":
-        ok = call("make_asset.py", args.name, *[str(Path(p).resolve()) for p in args.inputs])
+        ok = call("make_asset.py", args.name, *[str(Path(p).resolve()) for p in args.inputs],
+                  *(["--nemotron"] if args.nemotron else []))
         if ok:
             call("make_scene.py", args.name, "--no-view")
             print(f"next: python photo2grasp.py check {args.name}   (look at it)   or   train {args.name}")
